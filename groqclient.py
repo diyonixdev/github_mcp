@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).with_name(".env"),override=True)
 
-def get_llm(model: str = "openai/gpt-oss-120b",temperature=0 ) -> ChatGroq: 
+def get_llm(model: str = "llama-3.1-8b-instant",temperature=0 ) -> ChatGroq: 
     api_key = os.getenv("GROQ_API_KEY") 
     if not api_key: 
         raise ValueError("GROQ_API_KEY not found.please make sure it ia in you .env file")
