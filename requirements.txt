@@ -3,3 +3,4 @@ langchain-core
 langgraph
 langchain-groq
 python-dotenv
+langchain-mcp-adapters
