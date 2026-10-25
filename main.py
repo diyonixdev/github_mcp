@@ -1,13 +1,16 @@
 import asyncio
 import io
 import contextlib
+import json
 import os
 import time
+from collections import Counter
 from datetime import datetime
 from dotenv import load_dotenv
 
 from langchain_core.messages import AIMessage,HumanMessage,ToolMessage
 from langgraph.graph import END,START,StateGraph
+from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import ToolNode
 
 from groqclient import get_llm
@@ -26,7 +29,12 @@ MAX_MESSAGE_HISTORY = 10  # Keep only last N messages to control context size
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "60"))          # one model call
 TOOL_TIMEOUT = float(os.getenv("TOOL_TIMEOUT", "45"))        # one MCP tool call
 AGENT_TIMEOUT = float(os.getenv("AGENT_TIMEOUT", "180"))     # whole request
-GRAPH_RECURSION_LIMIT = int(os.getenv("GRAPH_RECURSION_LIMIT", "10"))  # assistant/tool loops
+# Each assistant -> tools round costs TWO supersteps (assistant + tools), so a
+# multi-step GitHub investigation needs well over 10. LangGraph's default is 25.
+GRAPH_RECURSION_LIMIT = int(os.getenv("GRAPH_RECURSION_LIMIT", "25"))
+# Loop guard: how many times the model may repeat an identical tool call
+# (same tool, same arguments) before the graph stops instead of spinning.
+MAX_IDENTICAL_TOOL_CALLS = int(os.getenv("MAX_IDENTICAL_TOOL_CALLS", "2"))
 
 #Timestamped trace for the current request. Printed to the console and surfaced
 #in the Streamlit "State Logs" panel so a hang can be located exactly.
@@ -54,6 +62,38 @@ def _truncate_if_tool_message(msg):
         return msg  
     truncated = content[:MAX_TOOL_MESSAGE_CHARS] + f"\n...(truncated,{len(content)}chars total)"    
     return ToolMessage(content=truncated,tool_call_id=msg.tool_call_id,name=msg.name)# covert back into and handover to langgraph
+
+def _tool_call_signatures(message) -> list[tuple[str, str]]:
+    """Stable (tool name, canonical args) signature for every tool call in a message.
+
+    Used by the router to detect the model re-issuing a call it has already made
+    with identical arguments, which would otherwise loop forever.
+    """
+    signatures: list[tuple[str, str]] = []
+    for call in getattr(message, "tool_calls", None) or []:
+        name = str(call.get("name", ""))
+        args = call.get("args", {})
+        try:
+            key = json.dumps(args, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            key = str(args)
+        signatures.append((name, key))
+    return signatures
+
+def _tool_error_to_message(error: Exception) -> str:
+    """Convert a tool runtime failure into a ToolMessage the model can read.
+
+    ToolNode's default handler re-raises anything that is not an argument
+    error, which would crash the whole graph instead of letting the agent
+    report the problem to the user.
+    """
+    detail = getattr(error, "message", None) or str(error)
+    _log(f"tools: failed with {type(error).__name__}: {detail}")
+    return (
+        f"Tool execution failed ({type(error).__name__}): {detail} "
+        f"- Do not issue the identical tool call again; answer using what you "
+        f"already have and state the limitation."
+    )
 
 #build graph function
 async def _build_graph():   
@@ -118,26 +158,49 @@ async def _build_graph():
     
     # 2 Routing logic
 
-    def route_assistant(state:State):  #Is code ka kaam hai decide karna ki AI ke response ke baad ab kya karna hai — tool chalana hai ya process khatam karna hai. 
-        last_message = state["messages"][-1]    
-        if last_message.tool_calls: 
-            return "tools"  
-        return "end" 
+    def route_assistant(state:State):  #Is code ka kaam hai decide karna ki AI ke response ke baad ab kya karna hai - tool chalana hai ya process khatam karna hai. 
+        last_message = state["messages"][-1]
+        pending = _tool_call_signatures(last_message)
+
+        # Normal termination: the model produced a plain answer -> END.
+        if not pending:
+            return "end"
+
+        # Loop guard: count identical (tool, args) calls already issued by
+        # earlier assistant turns. Routing to tools again with the very same
+        # arguments cannot make progress, so stop at END instead.
+        already_issued: Counter = Counter()
+        for previous in state["messages"][:-1]:
+            already_issued.update(_tool_call_signatures(previous))
+
+        repeated = [sig for sig in pending if already_issued[sig] >= MAX_IDENTICAL_TOOL_CALLS]
+        if repeated:
+            _log(
+                f"route: repeated tool call {repeated[0][0]} issued "
+                f"{already_issued[repeated[0]] + 1}x -> stopping at END"
+            )
+            return "end"
+
+        return "tools" 
 
 
 
 
     #2b Tool execution wrapper: timestamps the call and caps it so a stalled
     #MCP/network response cannot block the request indefinitely.
-    tool_node = ToolNode(tools)
+    tool_node = ToolNode(tools, handle_tool_errors=_tool_error_to_message)
 
-    async def tools_node(state: State):
+    async def tools_node(state: State, config):
         last = state["messages"][-1]
         names = [tc.get("name") for tc in getattr(last, "tool_calls", []) or []]
         _log(f"tools: executing {names} (timeout={TOOL_TIMEOUT}s)")
         t_tool = time.perf_counter()
         try:
-            result = await asyncio.wait_for(tool_node.ainvoke(state), timeout=TOOL_TIMEOUT)
+            # config must be forwarded: ToolNode needs LangGraph's runtime
+            # config, otherwise it fails before the tool even runs.
+            result = await asyncio.wait_for(
+                tool_node.ainvoke(state, config), timeout=TOOL_TIMEOUT
+            )
         except asyncio.TimeoutError as exc:
             _log(f"tools: TIMED OUT after {TOOL_TIMEOUT}s -> {names}")
             raise TimeoutError(
@@ -225,6 +288,14 @@ def ask_github_mcp_agent(repo: str, question: str):
                 f"Agent exceeded the {AGENT_TIMEOUT}s request budget. "
                 f"Increase AGENT_TIMEOUT if the repository is large."
             ) from exc
+        except GraphRecursionError as exc:
+            # Should now be rare: the router stops repeated tool calls itself.
+            _log(f"graph.ainvoke hit the recursion limit of {GRAPH_RECURSION_LIMIT}")
+            raise RuntimeError(
+                f"The agent did not reach a final answer within "
+                f"{GRAPH_RECURSION_LIMIT} steps. Rephrase the question as smaller "
+                f"steps, or raise GRAPH_RECURSION_LIMIT."
+            ) from exc
         _log(f"graph.ainvoke done in {time.perf_counter()-t_invoke:.2f}s")
 
         logs = get_state_logs(result)
@@ -235,6 +306,20 @@ def ask_github_mcp_agent(repo: str, question: str):
             if isinstance(msg, AIMessage) and msg.content:#Checks whether the message is from the AI and contains content.
                 answer = msg.content #Saves the AI's message as the answer.
                 break
+
+        if answer == "No answer generated.":
+            # The loop guard stopped the run before the model emitted prose.
+            # Fall back to the most recent tool result so the user still gets
+            # something useful instead of a bare placeholder.
+            for msg in reversed(result["messages"]):
+                if isinstance(msg, ToolMessage) and msg.content:
+                    answer = (
+                        "I stopped after the model repeatedly issued the same "
+                        "tool call, to avoid an endless loop. The most recent "
+                        f"tool result was:\n\n{msg.content}"
+                    )
+                    _log("answer: fell back to last ToolMessage after loop guard")
+                    break
 
         _log(f"request complete in {time.perf_counter()-t_start:.2f}s")
         return answer, logs #Returns two things: the AI's answer and the execution logs.
